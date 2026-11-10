@@ -51,6 +51,7 @@ cp -p "$CONF" /tmp/ocu-config.bak
 echo "Froxlor $START in $FROXLOR"
 
 echo "Snapshot impossible (no dump tool) -> nothing changes"
+snapshots_before="$(find /var/backups/$NAME -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l)"
 hidden=()
 for tool in mariadb-dump mysqldump; do
 	path="$(command -v "$tool" || true)"
@@ -62,7 +63,7 @@ done
 run
 check "result snapshot_failed" '[[ "$(field code)" == snapshot_failed ]]'
 check "version unchanged" '[[ "$(version)" == "$START" ]]'
-check "no half snapshot left" '[[ -z "$(find /var/backups/$NAME -mindepth 1 -maxdepth 1 -newer $STATE/logs -name "*-$START" -type d 2>/dev/null)" ]] || true'
+check "no half snapshot left" '[[ "$(find /var/backups/$NAME -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l)" == "$snapshots_before" ]]'
 for path in "${hidden[@]}"; do chmod +x "$path"; done
 
 echo "Froxlor cron job running -> waits, then gives up, nothing changes"
@@ -84,7 +85,8 @@ sed -i 's/^METHOD=.*/METHOD="apt"/' "$CONF"
 # apt that knows no newer froxlor package (stubs first in PATH).
 mkdir -p /tmp/ocu-stubs
 printf '#!/bin/sh\nexit 0\n' >/tmp/ocu-stubs/apt-get
-printf '#!/bin/sh\necho "froxlor:\n  Installed: 1.0\n  Candidate: 1.0"\n' >/tmp/ocu-stubs/apt-cache
+# Like apt, the stub answers in German unless LC_ALL=C is set.
+printf '#!/bin/sh\nif [ "$LC_ALL" = C ]; then echo "froxlor:\n  Installed: 1.0\n  Candidate: 1.0"; else echo "froxlor:\n  Installiert: 1.0\n  Installationskandidat: 1.0"; fi\n' >/tmp/ocu-stubs/apt-cache
 printf '#!/bin/sh\necho 1.0\n' >/tmp/ocu-stubs/dpkg-query
 chmod +x /tmp/ocu-stubs/*
 for stub in apt-get apt-cache dpkg-query; do
@@ -92,6 +94,8 @@ for stub in apt-get apt-cache dpkg-query; do
 done
 timeout 60 env OCU_CRON_WAIT=10 OCU_NO_CRON_WINDOW=1 "$TOOL" run >/dev/null 2>&1
 check "not blocked by fake locks, apt path: apt_no_candidate" '[[ "$(field code)" == apt_no_candidate ]]'
+check "SNAPSHOTS=0 leaves existing snapshots alone" '[[ "$(find /var/backups/$NAME -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l)" == "$snapshots_before" ]]'
+check "apt answer read in any language (candidate found)" 'grep -q "installed 1.0, available 1.0" "$STATE/logs/$(field log)"'
 check "version unchanged" '[[ "$(version)" == "$START" ]]'
 for stub in apt-get apt-cache dpkg-query; do
 	[[ "$(readlink "/usr/local/bin/$stub" 2>/dev/null)" == "/tmp/ocu-stubs/$stub" ]] && rm -f "/usr/local/bin/$stub"

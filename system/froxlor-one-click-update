@@ -265,12 +265,12 @@ make_snapshot() {
 	return 0
 }
 
-# Keep the newest SNAPSHOTS snapshots (at least the one just taken) and
-# KEEP_LOGS logs. Both directories are root-owned and not writable by others.
+# Keep the newest SNAPSHOTS snapshots and KEEP_LOGS logs. With SNAPSHOTS=0
+# no new snapshots are taken and the existing ones stay untouched. Both
+# directories are root-owned and not writable by others.
 prune() {
 	local keep="$SNAPSHOTS" list=() i
-	if [[ -d "$BACKUPS" && ! -L "$BACKUPS" ]]; then
-		((keep < 1)) && keep=1
+	if ((keep > 0)) && [[ -d "$BACKUPS" && ! -L "$BACKUPS" ]]; then
 		mapfile -t list < <(find "$BACKUPS" -mindepth 1 -maxdepth 1 -type d -regextype posix-extended \
 			-regex '.*/[0-9]{8}-[0-9]{6}-[^/]+' -printf '%f\n' 2>/dev/null | sort)
 		for ((i = 0; i < ${#list[@]} - keep; i++)); do
@@ -298,7 +298,8 @@ apt_check() {
 	log "apt-get update"
 	run_logged apt-get -q -o DPkg::Lock::Timeout=600 update || return 2
 	installed="$(dpkg-query -W -f='${Version}' froxlor 2>/dev/null)"
-	candidate="$(apt-cache policy froxlor 2>/dev/null | awk '/Candidate:/ {print $2; exit}')"
+	# LC_ALL=C: apt translates "Candidate:" (German: "Installationskandidat:").
+	candidate="$(LC_ALL=C apt-cache policy froxlor 2>/dev/null | awk '/Candidate:/ {print $2; exit}')"
 	log "Package froxlor: installed $installed, available ${candidate:-none}"
 	if [[ -z "$candidate" || "$candidate" == "(none)" || "$candidate" == "$installed" ]]; then
 		return 1

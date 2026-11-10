@@ -1,0 +1,634 @@
+#!/usr/bin/env bash
+#
+# One-Click Update for Froxlor 2.x — the root side.
+#
+#   froxlor-one-click-update run              update Froxlor now (the service runs this)
+#   froxlor-one-click-update status           result of the last run
+#   froxlor-one-click-update snapshots        list the snapshots taken before updates
+#   froxlor-one-click-update restore NAME     put Froxlor back to a snapshot (asks first)
+#
+# The panel cannot run anything as root. Its "Update now" button only creates
+# the file request/trigger in the state directory; systemd watches that file
+# (froxlor-one-click-update.path) and starts froxlor-one-click-update.service,
+# which runs "run" as root. The content of the request directory is never
+# read here — the panel user controls it — the trigger is only removed.
+#
+# What "run" does, in this order:
+#   1. check     froxlor-cli froxlor:update --check-only: is there a newer version?
+#   2. wait      until no Froxlor cron job is running and the next cron start
+#                is not imminent (the update must not overlap a cron run)
+#   3. snapshot  Froxlor directory (without cache/ and updates/) and a dump of
+#                Froxlor's database to /var/backups/froxlor-one-click-update/
+#   4. update    "archive": froxlor-cli froxlor:update -A — download from
+#                froxlor.org, checksum, unpack, database update (exactly what
+#                an admin would type);
+#                "apt": apt-get install --only-upgrade froxlor, then
+#                froxlor-cli froxlor:update --database -A (Debian package
+#                installs must be updated by the package manager, otherwise
+#                dpkg and the files disagree and a later apt run can bring
+#                back older files)
+#   5. verify    files and database report the same, new version
+#   6. extensions  run install.sh of the extensions listed in REINSTALL
+#                (Froxlor's own instruction for extensions: re-run after an
+#                update), then clear the Twig cache
+#   7. prune     keep the newest SNAPSHOTS snapshots and 20 logs
+#
+# Progress goes to status.json (read by the panel) and to one log file per run.
+
+set -uo pipefail
+umask 022
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+
+NAME=froxlor-one-click-update
+TOOL_VERSION="@VERSION@"
+CONFIG="${OCU_CONFIG:-/etc/$NAME/config}"
+LIB="${OCU_LIB:-/usr/local/lib/$NAME}"
+STATE="${OCU_STATE:-/var/lib/$NAME}"
+BACKUPS="${OCU_BACKUPS:-/var/backups/$NAME}"
+# In the root-owned state directory, not in the world-writable /run/lock:
+# there anyone could create (and hold) it first.
+LOCK="${OCU_LOCK:-$STATE/run.lock}"
+CRON_LOCK_DIR="${OCU_CRON_LOCK_DIR:-/run/lock}"
+# How long to wait for running Froxlor cron jobs before giving up (seconds).
+CRON_WAIT="${OCU_CRON_WAIT:-900}"
+# Tests only: skip the wait for the 5-minute cron rhythm.
+NO_CRON_WINDOW="${OCU_NO_CRON_WINDOW:-0}"
+KEEP_LOGS=20
+
+# shellcheck source=../scripts/privileges.sh
+. "$LIB/privileges.sh"
+
+die() { echo "ERROR: $*" >&2; exit 1; }
+
+# During "run", errors before the config is loaded still reach the panel:
+# status.json gets the group of request/ (install.sh gives it the panel
+# group), so the page can read why nothing happened.
+setup_fail() {
+	local gid now
+	gid="$(file_gid "$STATE/request" 2>/dev/null || echo -1)"
+	now="$(date +%s)"
+	php "$LIB/helper.php" status-set "$STATE/status.json" "$gid" --reset state=failed phase=finished \
+		code=setup_failed detail="$*" started="$now" finished="$now" >/dev/null 2>&1 || true
+	die "$*"
+}
+cfg_die() {
+	if [[ "${RUN_MODE:-0}" == 1 ]]; then
+		setup_fail "$@"
+	fi
+	die "$@"
+}
+
+# conf KEY DEFAULT: one value from the config file (KEY=value, optional
+# double quotes). The file is parsed, not sourced.
+conf() {
+	local line value
+	line="$(grep -E "^$1=" "$CONFIG" 2>/dev/null | tail -n 1)"
+	if [[ -z "$line" ]]; then
+		printf '%s' "$2"
+		return
+	fi
+	value="${line#*=}"
+	value="${value%\"}"
+	value="${value#\"}"
+	printf '%s' "$value"
+}
+
+load_config() {
+	[[ -f "$CONFIG" ]] || cfg_die "$CONFIG is missing — run install.sh again."
+	if [[ $EUID -eq 0 ]]; then
+		local bad
+		bad="$(untrusted_component "$CONFIG")"
+		[[ -z "$bad" ]] || cfg_die "$bad is a link or owned/writable by someone other than root."
+	fi
+	FROXLOR="$(conf FROXLOR_DIR '')"
+	PANEL_GID="$(conf PANEL_GID '')"
+	METHOD_SETTING="$(conf METHOD auto)"
+	SNAPSHOTS="$(conf SNAPSHOTS 3)"
+	REINSTALL="$(conf REINSTALL '')"
+	[[ -n "$FROXLOR" && -f "$FROXLOR/lib/init.php" && -x "$FROXLOR/bin/froxlor-cli" ]] \
+		|| cfg_die "FROXLOR_DIR in $CONFIG does not point to a Froxlor installation."
+	[[ "$PANEL_GID" =~ ^[0-9]+$ ]] || cfg_die "PANEL_GID in $CONFIG must be a numeric group id."
+	[[ "$SNAPSHOTS" =~ ^[0-9]+$ ]] || cfg_die "SNAPSHOTS in $CONFIG must be a number."
+	case "$METHOD_SETTING" in
+		auto | archive | apt) ;;
+		*) cfg_die "METHOD in $CONFIG must be auto, archive or apt." ;;
+	esac
+}
+
+# The update method actually used. "auto": Froxlor files that belong to a
+# Debian package are updated with apt, everything else from the archive.
+detect_method() {
+	if [[ "$METHOD_SETTING" != auto ]]; then
+		printf '%s' "$METHOD_SETTING"
+	elif command -v dpkg-query >/dev/null 2>&1 \
+		&& dpkg-query -S "$FROXLOR/lib/Froxlor/Froxlor.php" 2>/dev/null | grep -q '^froxlor:'; then
+		printf 'apt'
+	else
+		printf 'archive'
+	fi
+}
+
+# status KEY=VALUE...: update status.json (read by the panel).
+status() { php "$LIB/helper.php" status-set "$STATE/status.json" "$PANEL_GID" "$@" >/dev/null || true; }
+status_get() { php "$LIB/helper.php" status-get "$STATE/status.json" "$1" 2>/dev/null; }
+
+# froxlor_state reads the current versions ("helper.php state") into
+# STATE_JSON; state_field FIELD prints one of them. Errors go to the log.
+froxlor_state() { STATE_JSON="$(php "$LIB/helper.php" state "$FROXLOR" 2>>"$LOGFILE")"; }
+state_field() {
+	php -r '$d = json_decode($argv[1], true); $v = is_array($d) ? ($d[$argv[2]] ?? "") : ""; echo is_bool($v) ? ($v ? "1" : "0") : $v;' "$STATE_JSON" "$1"
+}
+
+log() { printf '%s %s\n' "$(date '+%H:%M:%S')" "$*" | tee -a "$LOGFILE"; }
+
+# run_logged CMD...: run CMD, its output into the log (control characters
+# removed). Returns CMD's exit code.
+run_logged() {
+	"$@" </dev/null 2>&1 | sanitize_output | tee -a "$LOGFILE"
+	return "${PIPESTATUS[0]}"
+}
+
+cli() { (cd / && "$FROXLOR/bin/froxlor-cli" "$@"); }
+
+# A run ends here: final status, prune, exit. A run that found nothing to
+# do puts the report of the previous run back (with its snapshot hint) and
+# only notes when it checked — the panel keeps showing the last real update.
+finish() {
+	local result="$1" code="$2" detail="${3:-}"
+	log "Result: $result ($code)${detail:+ — $detail}"
+	if [[ "$result" == uptodate && -f "$STATE/status.previous.json" ]]; then
+		mv -f -- "$STATE/status.previous.json" "$STATE/status.json"
+		status checked="$(date +%s)"
+	else
+		rm -f -- "$STATE/status.previous.json"
+		status state="$result" phase=finished code="$code" detail="${detail:--}" finished="$(date +%s)"
+	fi
+	prune
+	exit 0
+}
+
+fail() {
+	local code="$1"
+	shift
+	finish failed "$code" "$*"
+}
+
+# Name of a Froxlor cron lock file whose process is alive, if any. Froxlor's
+# MasterCron writes /run/lock/froxlor_<job>.lock with {"pid": …} while a job
+# runs. /run/lock is world-writable (sticky): only regular files are read, at
+# most 512 bytes, with a timeout — a fake lock can only make the update wait.
+cron_busy() {
+	local file pid
+	for file in "$CRON_LOCK_DIR"/froxlor_*.lock; do
+		[[ -f "$file" && ! -L "$file" ]] || continue
+		pid="$(timeout 5 head -c 512 -- "$file" 2>/dev/null | grep -o '"pid":[0-9]*' | head -n 1 | cut -d: -f2)"
+		if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+			printf '%s' "${file##*/}"
+			return 0
+		fi
+	done
+	return 1
+}
+
+# Froxlor's cron starts every five minutes. Its first step checks whether
+# files and database versions match — during the few seconds between
+# unpacking and the database update they do not. Starting at least 45
+# seconds before and 15 seconds after the five-minute mark keeps the two apart.
+near_cron_start() {
+	[[ "$NO_CRON_WINDOW" == 1 ]] && return 1
+	local s=$(($(date +%s) % 300))
+	((s >= 255 || s < 15))
+}
+
+wait_for_cron() {
+	local waited=0 busy announced=0
+	while :; do
+		if busy="$(cron_busy)"; then
+			((announced)) || log "Waiting for the running Froxlor cron job ($busy) ..."
+			announced=1
+		elif near_cron_start; then
+			((announced)) || log "Waiting for the next Froxlor cron start to pass ..."
+			announced=1
+		else
+			return 0
+		fi
+		if ((waited >= CRON_WAIT)); then
+			return 1
+		fi
+		sleep 5
+		waited=$((waited + 5))
+	done
+}
+
+# Snapshot of the Froxlor directory and its database before anything changes.
+make_snapshot() {
+	local parent base dir cnf db dump
+	parent="$(dirname "$FROXLOR")"
+	base="$(basename "$FROXLOR")"
+	SNAPSHOT="$(date '+%Y%m%d-%H%M%S')-$FROM"
+	dir="$BACKUPS/$SNAPSHOT"
+	install -d -o 0 -g 0 -m 0700 "$BACKUPS" || return 1
+	mkdir -m 0700 "$dir" || return 1
+
+	log "Snapshot $SNAPSHOT: files"
+	# tar does not follow symbolic links; cache/ and updates/ are recreated
+	# by Froxlor, their content is not needed.
+	if ! run_logged tar -C "$parent" --exclude="$base/cache/*" --exclude="$base/updates/*" \
+		-czf "$dir/files.tar.gz" -- "$base"; then
+		return 1
+	fi
+
+	log "Snapshot $SNAPSHOT: database"
+	dump="$(command -v mariadb-dump || command -v mysqldump || true)"
+	if [[ -z "$dump" ]]; then
+		log "mariadb-dump/mysqldump not found (package mariadb-client or default-mysql-client)."
+		return 1
+	fi
+	cnf="$(mktemp "$dir/.client-XXXXXX.cnf")" || return 1
+	if ! db="$(php "$LIB/helper.php" client-options "$FROXLOR" "$cnf" 2>>"$LOGFILE")"; then
+		rm -f -- "$cnf"
+		return 1
+	fi
+	# --defaults-extra-file must be the first option. The password never
+	# appears on a command line.
+	"$dump" --defaults-extra-file="$cnf" --single-transaction --routines --triggers \
+		--no-tablespaces --default-character-set=utf8mb4 -- "$db" 2>>"$LOGFILE" | gzip -6 >"$dir/database.sql.gz"
+	local dump_rc=("${PIPESTATUS[@]}")
+	rm -f -- "$cnf"
+	if [[ "${dump_rc[0]}" != 0 || "${dump_rc[1]}" != 0 ]]; then
+		log "Database dump failed."
+		return 1
+	fi
+	printf 'froxlor_dir=%s\nversion=%s\nmethod=%s\ncreated=%s\n' "$FROXLOR" "$FROM" "$METHOD" "$(date -Is)" >"$dir/info"
+	log "Snapshot $SNAPSHOT: $(du -sh "$dir" 2>/dev/null | cut -f1)"
+	return 0
+}
+
+# Keep the newest SNAPSHOTS snapshots (at least the one just taken) and
+# KEEP_LOGS logs. Both directories are root-owned and not writable by others.
+prune() {
+	local keep="$SNAPSHOTS" list=() i
+	if [[ -d "$BACKUPS" && ! -L "$BACKUPS" ]]; then
+		((keep < 1)) && keep=1
+		mapfile -t list < <(find "$BACKUPS" -mindepth 1 -maxdepth 1 -type d -regextype posix-extended \
+			-regex '.*/[0-9]{8}-[0-9]{6}-[^/]+' -printf '%f\n' 2>/dev/null | sort)
+		for ((i = 0; i < ${#list[@]} - keep; i++)); do
+			rm -rf -- "${BACKUPS:?}/${list[i]}"
+		done
+	fi
+	if [[ -d "$STATE/logs" && ! -L "$STATE/logs" ]]; then
+		mapfile -t list < <(find "$STATE/logs" -mindepth 1 -maxdepth 1 -type f -name 'update-*.log' -printf '%f\n' 2>/dev/null | sort)
+		for ((i = 0; i < ${#list[@]} - KEEP_LOGS; i++)); do
+			rm -f -- "$STATE/logs/${list[i]}"
+		done
+	fi
+}
+
+update_archive() {
+	log "Update: froxlor-cli froxlor:update --yes-to-all"
+	run_logged cli froxlor:update -A
+}
+
+# apt: is there a newer froxlor package? Asked before the snapshot, so a
+# package source that lags behind froxlor.org costs no snapshot.
+apt_check() {
+	local installed candidate
+	export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l
+	log "apt-get update"
+	run_logged apt-get -q -o DPkg::Lock::Timeout=600 update || return 2
+	installed="$(dpkg-query -W -f='${Version}' froxlor 2>/dev/null)"
+	candidate="$(apt-cache policy froxlor 2>/dev/null | awk '/Candidate:/ {print $2; exit}')"
+	log "Package froxlor: installed $installed, available ${candidate:-none}"
+	if [[ -z "$candidate" || "$candidate" == "(none)" || "$candidate" == "$installed" ]]; then
+		return 1
+	fi
+	return 0
+}
+
+update_apt() {
+	export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l
+	log "Update: apt-get install --only-upgrade froxlor"
+	run_logged apt-get -q -y -o DPkg::Lock::Timeout=600 \
+		-o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold \
+		install --only-upgrade froxlor || return 1
+	log "Update: froxlor-cli froxlor:update --database --yes-to-all"
+	run_logged cli froxlor:update -d -A
+}
+
+reinstall_extensions() {
+	local pkg bad failed=()
+	for pkg in $REINSTALL; do
+		pkg="${pkg%/}"
+		if [[ ! -f "$pkg/install.sh" ]]; then
+			log "Extension $pkg: install.sh not found — skipped."
+			failed+=("$pkg")
+			continue
+		fi
+		bad="$(untrusted_component "$pkg/install.sh")"
+		if [[ -n "$bad" ]]; then
+			log "Extension $pkg: $bad is a link or owned/writable by someone other than root — skipped."
+			failed+=("$pkg")
+			continue
+		fi
+		log "Extension $pkg: install.sh $FROXLOR"
+		if ! run_logged bash -c 'cd / && exec bash "$0" "$1"' "$pkg/install.sh" "$FROXLOR"; then
+			log "Extension $pkg: install.sh failed."
+			failed+=("$pkg")
+		fi
+	done
+	FAILED_EXTENSIONS="${failed[*]:-}"
+}
+
+# Twig caches compiled templates. Cleared as the owner of the Froxlor
+# directory (that user owns cache/ and could plant links in it).
+clear_twig_cache() {
+	local uid gid
+	[[ -d "$FROXLOR/cache" && ! -L "$FROXLOR/cache" ]] || return 0
+	uid="$(file_uid "$FROXLOR")"
+	gid="$(file_gid "$FROXLOR")"
+	if [[ "$uid" != 0 ]]; then
+		drop_to "$uid" "$gid" find "$FROXLOR/cache" -mindepth 1 -maxdepth 1 -type d -exec rm -rf {} + </dev/null >/dev/null 2>&1 || true
+	else
+		find "$FROXLOR/cache" -mindepth 1 -maxdepth 1 -type d -exec rm -rf {} + 2>/dev/null || true
+	fi
+}
+
+# Room for the update: download and new files next to the old ones in the
+# Froxlor file system, the snapshot in the backup file system.
+check_space() {
+	local size free need
+	size="$(du -sk --exclude=cache --exclude=updates "$FROXLOR" 2>/dev/null | cut -f1)"
+	[[ "$size" =~ ^[0-9]+$ ]] || size=200000
+	free="$(df -Pk "$FROXLOR" 2>/dev/null | awk 'NR == 2 {print $4}')"
+	need=$((size * 2 + 102400))
+	if [[ "$free" =~ ^[0-9]+$ ]] && ((free < need)); then
+		log "Not enough space for the update in $FROXLOR: $((free / 1024)) MB free, $((need / 1024)) MB needed."
+		return 1
+	fi
+	if ((SNAPSHOTS > 0)); then
+		install -d -o 0 -g 0 -m 0700 "$BACKUPS" || return 1
+		free="$(df -Pk "$BACKUPS" 2>/dev/null | awk 'NR == 2 {print $4}')"
+		need=$((size + 51200))
+		if [[ "$free" =~ ^[0-9]+$ ]] && ((free < need)); then
+			log "Not enough space for the snapshot in $BACKUPS: $((free / 1024)) MB free, $((need / 1024)) MB needed."
+			return 1
+		fi
+	fi
+	return 0
+}
+
+cmd_run() {
+	[[ $EUID -eq 0 || "${OCU_TEST:-0}" == 1 ]] || die "run as root."
+	RUN_MODE=1
+	# Consume the request first: whatever happens below, the path unit must
+	# not start the service again and again for the same request. Only
+	# unlinked, never read or followed.
+	rm -f -- "$STATE/request/trigger"
+	[[ -d "$STATE" && ! -L "$STATE" ]] || die "$STATE is missing — run install.sh again."
+	load_config
+	install -d -m 0750 -g "$PANEL_GID" "$STATE/logs" || setup_fail "cannot create $STATE/logs"
+
+	exec 9>"$LOCK" || setup_fail "cannot open $LOCK"
+	if ! flock -n 9; then
+		echo "Another run is in progress."
+		exit 0
+	fi
+
+	METHOD="$(detect_method)"
+	LOGFILE="$STATE/logs/update-$(date '+%Y%m%d-%H%M%S').log"
+	: >"$LOGFILE"
+	chgrp "$PANEL_GID" "$LOGFILE" 2>/dev/null || true
+	chmod 0640 "$LOGFILE"
+
+	rm -f -- "$STATE/status.previous.json"
+	if [[ -f "$STATE/status.json" && ! -L "$STATE/status.json" ]]; then
+		cp -p -- "$STATE/status.json" "$STATE/status.previous.json"
+	fi
+	status --reset state=running phase=check started="$(date +%s)" method="$METHOD" \
+		log="$(basename "$LOGFILE")" tool_version="$TOOL_VERSION"
+	log "One-Click Update $TOOL_VERSION — Froxlor in $FROXLOR, method: $METHOD"
+
+	froxlor_state || fail state_failed "cannot read the installed version (details in the log)"
+	FROM="$(state_field version)"
+	local pending
+	pending="$(state_field pending)"
+	status from="$FROM"
+	log "Installed: $FROM (database: $(state_field db_version)), channel: $(state_field channel)"
+
+	local target=""
+	if [[ "$pending" == 1 ]]; then
+		log "The files are newer than the database: only the database update is pending."
+	else
+		log "Checking for a newer version ..."
+		local out rc=x
+		# Only stdout is evaluated; notices on stderr go to the log. The
+		# answer is the integer at the very end.
+		out="$(cli froxlor:update --check-only --integer-return </dev/null 2>>"$LOGFILE")"
+		if [[ "$out" =~ (^|[^0-9])(-?[01])$ ]]; then
+			rc="${BASH_REMATCH[2]}"
+		fi
+		case "$rc" in
+			1) ;;
+			0) finish uptodate no_update ;;
+			*)
+				printf '%s\n' "$out" | sanitize_output >>"$LOGFILE"
+				fail check_failed "froxlor:update --check-only did not answer (Froxlor's version server unreachable?)"
+				;;
+		esac
+		# The version number is shown by the normal check; the integer mode does not print it.
+		target="$(cli froxlor:update --check-only </dev/null 2>&1 | sanitize_output | grep -oE '[0-9]+\.[0-9]+\.[0-9]+[0-9A-Za-z.+~-]*' | grep -vxF "$FROM" | head -n 1)"
+		log "Available: ${target:-a newer version}"
+		status target="${target:--}"
+		if [[ "$METHOD" == apt ]]; then
+			apt_check
+			case $? in
+				0) ;;
+				1) fail apt_no_candidate "the package source offers no newer froxlor package yet" ;;
+				*) fail check_failed "apt-get update failed" ;;
+			esac
+		fi
+	fi
+
+	check_space || fail no_space "not enough disk space, nothing was changed"
+
+	status phase=wait
+	wait_for_cron || fail cron_busy "a Froxlor cron job has been running for more than $((CRON_WAIT / 60)) minutes"
+
+	if ((SNAPSHOTS > 0)); then
+		status phase=snapshot
+		if ! make_snapshot; then
+			rm -rf -- "${BACKUPS:?}/${SNAPSHOT:?}"
+			fail snapshot_failed "no snapshot, nothing was changed"
+		fi
+		status snapshot="$SNAPSHOT"
+	else
+		log "Snapshots are switched off (SNAPSHOTS=0)."
+	fi
+
+	# A large snapshot can take minutes: check the cron rhythm once more
+	# right before files change.
+	wait_for_cron || fail cron_busy "a Froxlor cron job has been running for more than $((CRON_WAIT / 60)) minutes"
+
+	local update_rc=0
+	if [[ "$pending" == 1 ]]; then
+		status phase=database
+		log "Update: froxlor-cli froxlor:update --database --yes-to-all"
+		run_logged cli froxlor:update -d -A
+		update_rc=$?
+	else
+		status phase=update
+		if [[ "$METHOD" == apt ]]; then
+			update_apt
+		else
+			update_archive
+		fi
+		update_rc=$?
+	fi
+	((update_rc == 0)) || log "The update returned exit code $update_rc — checking the result."
+
+	status phase=verify
+	froxlor_state || fail state_failed "cannot read the installed version (details in the log)"
+	local to result=updated
+	to="$(state_field version)"
+	status to="$to"
+	if [[ "$(state_field pending)" == 1 ]]; then
+		log "Files: $to, database: $(state_field db_version) — the database update did not complete."
+		fail db_pending "files $to, database $(state_field db_version)"
+	fi
+	if [[ "$pending" == 1 ]]; then
+		# Only the database was behind; the files keep their version.
+		result=db_updated
+	elif [[ "$to" == "$FROM" ]]; then
+		# Froxlor's unpacking does not report partial failures (full disk):
+		# with an error code, files may have changed although the version did not.
+		((update_rc == 0)) && fail not_updated "still $FROM"
+		fail update_failed "exit code $update_rc, files may be partly changed"
+	fi
+	log "Froxlor is now at $to."
+
+	status phase=extensions
+	FAILED_EXTENSIONS=""
+	reinstall_extensions
+	clear_twig_cache
+
+	if [[ -n "$FAILED_EXTENSIONS" ]]; then
+		status warnings="$FAILED_EXTENSIONS"
+		finish "done" extensions_failed "Froxlor $to; re-run install.sh by hand: $FAILED_EXTENSIONS"
+	fi
+	finish "done" "$result" "$FROM -> $to"
+}
+
+# ExecStopPost of the service: a run that was killed (timeout, reboot, OOM)
+# must not stay "running" in the panel forever.
+cmd_service_stopped() {
+	load_config
+	if [[ "$(status_get state)" == running ]]; then
+		status state=failed phase=finished code=interrupted detail="${SERVICE_RESULT:-killed}" finished="$(date +%s)"
+	fi
+}
+
+cmd_status() {
+	if [[ -f "$STATE/status.json" ]]; then
+		cat -- "$STATE/status.json"
+	else
+		echo "No run yet."
+	fi
+}
+
+cmd_snapshots() {
+	[[ -d "$BACKUPS" ]] || { echo "No snapshots."; return; }
+	local dir found=0
+	for dir in "$BACKUPS"/*/; do
+		[[ -f "$dir/info" ]] || continue
+		found=1
+		printf '%s  %s\n' "$(basename "$dir")" "$(du -sh "$dir" 2>/dev/null | cut -f1)"
+	done
+	((found)) || echo "No snapshots."
+}
+
+# Puts the Froxlor directory and database back to a snapshot. The current
+# directory is kept next to it (…/froxlor.replaced-<time>) until the admin
+# removes it.
+cmd_restore() {
+	local name="${1:-}" yes="${2:-}" dir parent base stamp tmp cnf db client uid gid
+	[[ $EUID -eq 0 ]] || die "run as root."
+	[[ "$name" =~ ^[0-9]{8}-[0-9]{6}-[0-9A-Za-z.+~-]+$ ]] || die "Usage: $NAME restore <snapshot>   (see: $NAME snapshots)"
+	load_config
+	dir="$BACKUPS/$name"
+	[[ -f "$dir/files.tar.gz" && -f "$dir/database.sql.gz" ]] || die "snapshot $name not found or incomplete."
+	client="$(command -v mariadb || command -v mysql || true)"
+	[[ -n "$client" ]] || die "mariadb/mysql client not found."
+
+	echo "This puts Froxlor in $FROXLOR back to the state of $name:"
+	echo "  - the directory is replaced (the current one is kept as $FROXLOR.replaced-<time>)"
+	echo "  - Froxlor's database is overwritten with the dump (customer databases are not touched)"
+	if [[ "$yes" != "--yes" ]]; then
+		local answer
+		read -r -p "Type the snapshot name to continue: " answer
+		[[ "$answer" == "$name" ]] || die "aborted."
+	fi
+
+	exec 9>"$LOCK" || die "cannot open $LOCK"
+	flock -n 9 || die "an update is running."
+
+	parent="$(dirname "$FROXLOR")"
+	base="$(basename "$FROXLOR")"
+	# Root unpacks into and renames inside the parent directory: nobody else
+	# may be able to swap things there.
+	local bad
+	bad="$(untrusted_component "$parent")"
+	[[ -z "$bad" ]] || die "$bad is a link or owned/writable by someone other than root — restore by hand."
+	LOGFILE=/dev/null
+	echo "Waiting until no Froxlor cron job runs ..."
+	wait_for_cron || die "a Froxlor cron job keeps running — try again later."
+	stamp="$(date '+%Y%m%d-%H%M%S')"
+	uid="$(file_uid "$FROXLOR")"
+	gid="$(file_gid "$FROXLOR")"
+	tmp="$(mktemp -d "$parent/.$base.restore-XXXXXX")" || die "cannot create a directory in $parent"
+	echo "Unpacking files ..."
+	tar -C "$tmp" -xzf "$dir/files.tar.gz" || { rm -rf -- "$tmp"; die "unpacking failed, nothing was changed."; }
+	[[ -f "$tmp/$base/lib/init.php" ]] || { rm -rf -- "$tmp"; die "the snapshot does not contain $base/, nothing was changed."; }
+	install -d -o "$uid" -g "$gid" -m 0755 "$tmp/$base/cache" "$tmp/$base/updates" 2>/dev/null || true
+
+	echo "Restoring the database ..."
+	cnf="$(mktemp "$BACKUPS/.client-XXXXXX.cnf")" || die "cannot create a temporary file"
+	if ! db="$(php "$LIB/helper.php" client-options "$tmp/$base" "$cnf")"; then
+		rm -f -- "$cnf"
+		rm -rf -- "$tmp"
+		die "cannot read the database settings of the snapshot, nothing was changed."
+	fi
+	if ! gzip -dc "$dir/database.sql.gz" | "$client" --defaults-extra-file="$cnf" --default-character-set=utf8mb4 -- "$db"; then
+		rm -f -- "$cnf"
+		rm -rf -- "$tmp"
+		die "the database import failed. The files were not changed; check Froxlor's database."
+	fi
+	rm -f -- "$cnf"
+
+	mv -- "$FROXLOR" "$FROXLOR.replaced-$stamp" || die "cannot move $FROXLOR aside (the database is already restored)."
+	mv -- "$tmp/$base" "$FROXLOR" || die "cannot move the restored files to $FROXLOR — they are in $tmp/$base."
+	rmdir -- "$tmp" 2>/dev/null || true
+	clear_twig_cache
+	local now
+	now="$(date +%s)"
+	status --reset state=restored phase=finished code=restored detail="$name" snapshot="$name" started="$now" finished="$now"
+	echo
+	echo "Done. Froxlor is back at the state of $name."
+	echo "The replaced directory is $FROXLOR.replaced-$stamp — remove it when everything works."
+	if [[ "$(detect_method)" == apt ]]; then
+		echo "Froxlor belongs to a Debian package: dpkg still lists the newer version. Install the"
+		echo "matching package version (apt-get install froxlor=<version>) or update again soon."
+	fi
+}
+
+case "${1:-}" in
+	run) cmd_run ;;
+	service-stopped) cmd_service_stopped ;;
+	status) cmd_status ;;
+	snapshots) cmd_snapshots ;;
+	restore) cmd_restore "${2:-}" "${3:-}" ;;
+	*)
+		echo "Usage: $NAME run|status|snapshots|restore <snapshot>" >&2
+		exit 1
+		;;
+esac

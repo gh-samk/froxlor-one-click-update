@@ -1,0 +1,17 @@
+# One-Click Update for Froxlor: runs one update as root (see
+# /usr/local/sbin/froxlor-one-click-update). Started by the .path unit.
+[Unit]
+Description=One-Click Update for Froxlor
+After=network-online.target mariadb.service mysql.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/froxlor-one-click-update run
+ExecStopPost=/usr/local/sbin/froxlor-one-click-update service-stopped
+# Download, snapshot and database update usually take about a minute; apt
+# may have to wait for another package run first.
+TimeoutStartSec=45min
+Nice=5
+IOSchedulingClass=best-effort
+IOSchedulingPriority=6

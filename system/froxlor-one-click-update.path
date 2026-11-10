@@ -1,0 +1,12 @@
+# One-Click Update for Froxlor: starts the update service as soon as the
+# panel creates the request file. The panel's PHP user may create files in
+# request/ — nothing else; the service never reads them.
+[Unit]
+Description=One-Click Update for Froxlor: wait for an update request
+
+[Path]
+PathExists=@STATE@/request/trigger
+Unit=froxlor-one-click-update.service
+
+[Install]
+WantedBy=multi-user.target

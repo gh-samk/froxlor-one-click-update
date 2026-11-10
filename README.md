@@ -4,7 +4,7 @@ Update [Froxlor](https://froxlor.org) from the panel: when a new version is
 out, one click on **Update now** — with a snapshot of Froxlor's files and
 database taken first, live progress on the page, and a one-line way back.
 
-**Version 1.0.0** · Froxlor 2.3.x (tested with a real update from 2.3.13 to
+**Version 1.1.0** · Froxlor 2.3.x (tested with a real update from 2.3.13 to
 2.3.17) · PHP 8.1 or newer · systemd · GPL-2.0-or-later
 
 Froxlor tells admins when a new version exists and suggests running
@@ -25,6 +25,7 @@ as Froxlor's own version check knows of a newer release.
 * [Installation](#installation)
 * [Configuration](#configuration)
 * [Update and uninstall](#update-and-uninstall)
+* [Extension compatibility check](#extension-compatibility-check)
 * [Going back to a snapshot](#going-back-to-a-snapshot)
 * [Debian package installations](#debian-package-installations)
 * [Languages](#languages)
@@ -52,16 +53,19 @@ as Froxlor's own version check knows of a newer release.
                           5 verify    files and database at the same, new version
                           6 extensions  re-run install.sh of listed extensions,
                                         clear the Twig cache
-                          7 prune     keep the newest N snapshots, 20 logs
+                          7 compat    extensions still load with the new version?
+                          8 prune     keep the newest N snapshots, 20 logs
 ```
 
 1. **Check.** `froxlor-cli froxlor:update --check-only` — Froxlor's own
    version check against froxlor.org, with the update channel from Froxlor's
    settings. Nothing newer: the run ends and the page keeps showing the
    report of the last real update. With the apt method the package source is
-   asked here too, before any snapshot. Then the free space is checked
-   (twice the Froxlor directory plus 100 MB next to it, the directory's size
-   for the snapshot).
+   asked here too, before any snapshot. Then the
+   [compatibility check](#extension-compatibility-check) runs once on the
+   old version, so that problems that existed before are not blamed on the
+   update later, and the free space is checked (twice the Froxlor directory
+   plus 100 MB next to it, the directory's size for the snapshot).
 2. **Wait.** Froxlor's cron runs every five minutes and first checks that
    files and database have the same version. For the few seconds between
    unpacking and the database update they do not. The service waits until no
@@ -89,7 +93,12 @@ as Froxlor's own version check knows of a newer release.
    run again (as other Froxlor extensions ask for after an update), then the
    Twig cache is cleared. A failing installer does not undo the update; the
    page reports which one to run by hand.
-7. **Prune.** The newest `SNAPSHOTS` snapshots and 20 logs are kept.
+7. **Compatibility check.** The [check](#extension-compatibility-check) runs
+   again on the new version. Problems that were not there before are listed
+   on the page, with the snapshot to go back to. Nothing is rolled back
+   automatically: a broken extension page is often less harmful than undoing
+   a security update.
+8. **Prune.** The newest `SNAPSHOTS` snapshots and 20 logs are kept.
 
 While the update runs, the page shows the steps and the live log, and
 reloads itself once the run is over. Closing the page does not matter.
@@ -181,6 +190,56 @@ Remove it:
 ./uninstall.sh /var/www/froxlor            # files and service; config, logs and snapshots stay
 ./uninstall.sh /var/www/froxlor --purge    # everything
 ```
+
+## Extension compatibility check
+
+Extensions build on Froxlor's classes, menu and templates. A Froxlor update
+can rename or remove something an extension uses; the worst case is a menu
+file (`lib/navigation/*.php` is loaded on **every** panel page) that now
+fails, and with it the whole panel. So after every update the service loads
+what the panel would load, without a request:
+
+| Area | What must work |
+|---|---|
+| Navigation | all `lib/navigation/*.php` merged (once, as Froxlor does per request) and built — as an admin and as a customer (the first ones in the database) |
+| Settings | all `actions/admin/settings/*.php` merged (settings page, global search, settings export) |
+| Listings | the extensions' table lists (`lib/tablelisting/**/*.ext.*.php`) |
+| Classes | every class below `lib/Froxlor/Ext/` loads: parent classes and interfaces exist, method signatures still fit |
+| References | the extensions' PHP files are scanned for what they use of Froxlor: classes (`new`, `::`), static methods, class constants and properties, Froxlor's functions (namespace `Froxlor\`, `lng()`, `view()` …), `[Class::class, 'method']` callbacks — each must still exist |
+| Templates | every Twig template of the extensions compiles with Froxlor's Twig setup (after the extensions registered their Twig functions); templates named in `extends`, `include`, `embed`, `import`, `from` exist, and macros called through an import are defined (also in the templates it extends) |
+
+Not reported, because it cannot break anything by itself or would cause
+false alarms: `instanceof X` and `X::class` with a missing `X` (PHP gives
+`false` and a string), uses guarded by `function_exists()`,
+`class_exists()` … in the same file, anything in a file that compares
+Froxlor's version (`version_compare(Froxlor::VERSION, …)`,
+`Froxlor::isFroxlorVersion()` — code for several Froxlor versions), PHP
+functions outside Froxlor (the command line may lack extensions the web
+server has), and Froxlor's own templates (`templates/Froxlor/`,
+`templates/misc/`).
+
+"The extensions' PHP files" are everything below `lib/Froxlor/Ext/`, the
+`*.ext.*.php` files in Froxlor's menu, settings and listing directories, and
+the pages in the Froxlor directory that use an extension class.
+
+The check runs before the update too; only problems that are new afterwards
+count (compared without line numbers, so a problem that only moved is not
+new). If the check cannot run to the end — Froxlor itself does not load, a
+timeout of five minutes, or loaded code calls `exit` — the page says that
+the extensions could not be checked, without blaming one. It runs as the
+owner of the Froxlor directory, not as root. It cannot
+see everything: what happens on a real request (database queries, data that
+changed shape, JavaScript, behaviour) is not tested. Take it as an alarm for
+the breakages that take pages down, not as proof that everything works.
+
+Run it any time, for example after installing or updating an extension:
+
+```bash
+froxlor-one-click-update check
+```
+
+It prints one `FAIL` line per problem (`PASS` per area) and exits with 0 (no
+problems), 1 (problems) or 2 (the check could not run).
 
 ## Going back to a snapshot
 
@@ -274,6 +333,13 @@ it controls away from decisions root makes:
   system log.
 * **Extension installers** listed in `REINSTALL` run as root only if they and
   every directory above them are root-owned and not writable by others.
+* **The compatibility check runs as the owner of the Froxlor directory**
+  (`setpriv`, new session, no inherited file descriptors), not as root: it
+  loads Froxlor's and the extensions' code, which that user can change
+  anyway. Its output is stripped of control characters and limited to 2 MB
+  before it reaches the log. If root owns the Froxlor directory, it runs as
+  root only if no file in it (apart from `cache/`, `updates/`, `temp/`)
+  belongs to or is writable by another user; otherwise it does not run.
 * **`restore`** refuses to work if the directory above Froxlor is writable by
   anyone but root (it unpacks and renames there), and waits for Froxlor's
   cron like an update.
@@ -314,8 +380,9 @@ php tests/templates.php /path/to/froxlor
 
 renders the page in both languages for every state (update available,
 service missing, up to date, check failed, running, requested, failed,
-extensions failed) with `strict_variables`, and checks escaping, the CSRF
-field and the live-refresh script.
+extensions failed, extensions incompatible, not checked) with
+`strict_variables`, and checks escaping, the CSRF field and the live-refresh
+script.
 
 End-to-end, **on a disposable system only** — it really updates Froxlor and
 rolls it back: install an older Froxlor 2.3.x (for example the release archive
@@ -330,9 +397,23 @@ It checks the failure paths that must leave Froxlor untouched (no dump tool,
 a running cron job, fake lock files, apt without a newer package), the
 single-run lock, a broken config (request consumed, reason reported), the
 interrupted-run marker, that a linked trigger is not followed, a real update
-with snapshot, a run with nothing to do, a database that is behind its
-files, and the restore. The systemd units themselves can be checked with
-`systemd-analyze verify` and by creating `request/trigger` as the panel user.
+with snapshot (with a compatibility problem that existed before the update
+and one that comes with it), a run with nothing to do, a database that is
+behind its files, and the restore. The systemd units themselves can be
+checked with `systemd-analyze verify` and by creating `request/trigger` as
+the panel user.
+
+The compatibility check on its own, also on a disposable system:
+
+```bash
+OCU_DISPOSABLE=1 tests/compat.sh /var/www/froxlor
+```
+
+plants a deliberately broken extension (menu file, missing parent class,
+missing method, class, constant, function and callback, missing parent
+template, unknown filter, missing macro, a fatal signature mismatch) and
+checks that each is found, guarded uses are not, and the installed
+extensions are not affected.
 
 ## Layout
 
@@ -347,8 +428,9 @@ lib/Froxlor/Ext/OneClickUpdate/
     Lang.php, lang/de.php                  English/German texts
 templates/OneClickUpdate/update.html.twig  the page
 system/
-    froxlor-one-click-update               the root service script (run/status/snapshots/restore)
+    froxlor-one-click-update               the root service script (run/check/status/snapshots/restore)
     helper.php, DbConfig.php               versions, status files, database options (root side)
+    compat.php                             the extension compatibility check (as the panel user)
     froxlor-one-click-update.path/.service systemd units
 scripts/privileges.sh                      privilege helpers (installer and service)
 tests/                                     see above

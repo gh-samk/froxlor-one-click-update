@@ -29,6 +29,7 @@ return [
 	'Snapshots are switched off on this server (SNAPSHOTS=0).' => 'Sicherungen sind auf diesem Server abgeschaltet (SNAPSHOTS=0).',
 	'Websites, email and customer databases keep running. The update usually takes one to two minutes.' => 'Websites, E-Mail und Kundendatenbanken laufen weiter. Das Update dauert meist ein bis zwei Minuten.',
 	'Afterwards the installed extensions are set up again (%d).' => 'Danach werden die installierten Erweiterungen neu eingerichtet (%d).',
+	'Finally the extensions are checked against the new version: menu, settings, classes and templates must still load. Problems are reported here.' => 'Zum Schluss werden die Erweiterungen mit der neuen Version geprüft: Menü, Einstellungen, Klassen und Vorlagen müssen weiter laden. Probleme erscheinen hier.',
 
 	// Service missing / stuck
 	'The update service is not installed on this server.' => 'Der Update-Dienst ist auf diesem Server nicht eingerichtet.',
@@ -53,6 +54,7 @@ return [
 	'Install the new version' => 'Neue Version installieren',
 	'Check files and database' => 'Dateien und Datenbank prüfen',
 	'Reinstall extensions' => 'Erweiterungen neu einrichten',
+	'Check extensions with the new version' => 'Erweiterungen mit der neuen Version prüfen',
 	'This page refreshes itself. You can also close it: the update keeps running on the server.' => 'Diese Seite aktualisiert sich selbst. Sie können sie auch schließen: Das Update läuft auf dem Server weiter.',
 	'Refresh now' => 'Seite neu laden',
 	'Log' => 'Protokoll',
@@ -74,6 +76,12 @@ return [
 	// Results reported by the service
 	'Froxlor was updated from %s to %s.' => 'Froxlor wurde von %s auf %s aktualisiert.',
 	'Froxlor was updated from %s to %s, but the installer of at least one extension failed. Run it again by hand: %s' => 'Froxlor wurde von %s auf %s aktualisiert, aber das Installationsskript mindestens einer Erweiterung ist fehlgeschlagen. Bitte von Hand erneut ausführen: %s',
+	'Froxlor was updated from %s to %s, but at least one extension does not load correctly with the new version:' => 'Froxlor wurde von %s auf %s aktualisiert, aber mindestens eine Erweiterung lädt mit der neuen Version nicht fehlerfrei:',
+	'In addition, the installer of these extensions failed: %s' => 'Außerdem ist das Installationsskript dieser Erweiterungen fehlgeschlagen: %s',
+	'Update the extension or tell its author. If the panel shows errors in the meantime, put the snapshot back with the command below.' => 'Bitte die Erweiterung aktualisieren oder ihrem Autor Bescheid geben. Zeigt das Panel bis dahin Fehler, die Sicherung mit dem Befehl unten zurückspielen.',
+	'Update the extension or tell its author.' => 'Bitte die Erweiterung aktualisieren oder ihrem Autor Bescheid geben.',
+	'The extensions were checked with the new version: no new problems.' => 'Die Erweiterungen wurden mit der neuen Version geprüft: keine neuen Probleme.',
+	'The extensions could not be checked with the new version. Details are in the log.' => 'Die Erweiterungen konnten nicht mit der neuen Version geprüft werden. Details stehen im Protokoll.',
 	'The pending database update of Froxlor %s was completed.' => 'Das ausstehende Datenbank-Update von Froxlor %s wurde abgeschlossen.',
 	'Froxlor was put back to snapshot %s.' => 'Froxlor wurde auf die Sicherung %s zurückgesetzt.',
 	'The update command failed and the version did not change, but some files may have been replaced. Check the log; the snapshot can bring Froxlor back.' => 'Der Update-Befehl ist fehlgeschlagen und die Version hat sich nicht geändert, einzelne Dateien können aber schon ersetzt sein. Prüfen Sie das Protokoll; mit der Sicherung lässt sich Froxlor zurückholen.',

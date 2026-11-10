@@ -103,7 +103,7 @@ function ocu_write_json(string $file, array $data, int $gid): void
 	if ($fh === false) {
 		ocu_fail("Cannot create $tmp.");
 	}
-	fwrite($fh, json_encode($data, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE) . "\n");
+	fwrite($fh, json_encode($data, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_INVALID_UTF8_SUBSTITUTE) . "\n");
 	fclose($fh);
 	if ($gid >= 0) {
 		@chgrp($tmp, $gid);

@@ -128,7 +128,7 @@ FILES=(
 	"lib/Froxlor/Ext/OneClickUpdate/"
 	"templates/OneClickUpdate/"
 )
-SYSTEM_FILES=(system/froxlor-one-click-update system/helper.php system/DbConfig.php scripts/privileges.sh
+SYSTEM_FILES=(system/froxlor-one-click-update system/helper.php system/DbConfig.php system/compat.php scripts/privileges.sh
 	system/froxlor-one-click-update.path system/froxlor-one-click-update.service)
 for path in "${FILES[@]}" "${SYSTEM_FILES[@]}"; do
 	if [[ ! -e "$HERE/${path%/}" ]] || [[ -L "$HERE/${path%/}" ]]; then
@@ -302,6 +302,7 @@ fi
 install -d -o 0 -g 0 -m 0755 "$LIBDIR"
 install -o 0 -g 0 -m 0644 "$HERE/system/helper.php" "$LIBDIR/helper.php"
 install -o 0 -g 0 -m 0644 "$HERE/system/DbConfig.php" "$LIBDIR/DbConfig.php"
+install -o 0 -g 0 -m 0644 "$HERE/system/compat.php" "$LIBDIR/compat.php"
 install -o 0 -g 0 -m 0644 "$HERE/scripts/privileges.sh" "$LIBDIR/privileges.sh"
 tmp="$(mktemp)"
 sed "s|@VERSION@|$VERSION|g" "$HERE/system/$NAME" >"$tmp"

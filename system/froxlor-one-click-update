@@ -3,6 +3,7 @@
 # One-Click Update for Froxlor 2.x — the root side.
 #
 #   froxlor-one-click-update run              update Froxlor now (the service runs this)
+#   froxlor-one-click-update check            check the extensions against the installed Froxlor
 #   froxlor-one-click-update status           result of the last run
 #   froxlor-one-click-update snapshots        list the snapshots taken before updates
 #   froxlor-one-click-update restore NAME     put Froxlor back to a snapshot (asks first)
@@ -15,6 +16,9 @@
 #
 # What "run" does, in this order:
 #   1. check     froxlor-cli froxlor:update --check-only: is there a newer version?
+#                Then the compatibility check (see 7.) runs once on the old
+#                version, so problems that existed before are not blamed on
+#                the update.
 #   2. wait      until no Froxlor cron job is running and the next cron start
 #                is not imminent (the update must not overlap a cron run)
 #   3. snapshot  Froxlor directory (without cache/ and updates/) and a dump of
@@ -31,7 +35,12 @@
 #   6. extensions  run install.sh of the extensions listed in REINSTALL
 #                (Froxlor's own instruction for extensions: re-run after an
 #                update), then clear the Twig cache
-#   7. prune     keep the newest SNAPSHOTS snapshots and 20 logs
+#   7. compat    compat.php, as the owner of the Froxlor directory: menu,
+#                settings, classes, what the extensions use of Froxlor, and
+#                all templates must still load with the new version. New
+#                problems are reported (the snapshot can bring Froxlor back);
+#                nothing is rolled back automatically.
+#   8. prune     keep the newest SNAPSHOTS snapshots and 20 logs
 #
 # Progress goes to status.json (read by the panel) and to one log file per run.
 
@@ -156,6 +165,7 @@ cli() { (cd / && "$FROXLOR/bin/froxlor-cli" "$@"); }
 # only notes when it checked — the panel keeps showing the last real update.
 finish() {
 	local result="$1" code="$2" detail="${3:-}"
+	[[ -n "${COMPAT_BEFORE:-}" ]] && rm -f -- "$COMPAT_BEFORE"
 	log "Result: $result ($code)${detail:+ — $detail}"
 	if [[ "$result" == uptodate && -f "$STATE/status.previous.json" ]]; then
 		mv -f -- "$STATE/status.previous.json" "$STATE/status.json"
@@ -341,6 +351,114 @@ reinstall_extensions() {
 	FAILED_EXTENSIONS="${failed[*]:-}"
 }
 
+# compat_check FILE: the compatibility check (compat.php) with its output in
+# FILE. It loads Froxlor's and the extensions' code, so it runs as the owner
+# of the Froxlor directory — that user can change all of that code anyway —
+# not as root. If root owns the directory, it runs as root only when nobody
+# else owns or can write anything in it (apart from cache/, updates/ and
+# temp/, which hold no loaded code); otherwise it does not run. Its output
+# is limited to 2 MB. Returns 0 (no problems), 1 (problems) or 2 (the check
+# could not run or did not finish — no "DONE" line).
+compat_check() {
+	local out="$1" uid gid rc foreign
+	uid="$(file_uid "$FROXLOR")"
+	gid="$(file_gid "$FROXLOR")"
+	if [[ "$uid" != 0 ]]; then
+		drop_to "$uid" "$gid" timeout 300 php -d memory_limit=512M "$LIB/compat.php" "$FROXLOR" </dev/null | head -c 2M >"$out"
+		rc=${PIPESTATUS[0]}
+	else
+		foreign="$(find "$FROXLOR" \( -path "$FROXLOR/cache" -o -path "$FROXLOR/updates" -o -path "$FROXLOR/temp" \) -prune -o \
+			\( ! -user 0 -o -perm -0002 -o \( -perm -0020 ! -group 0 \) \) -print -quit 2>/dev/null)"
+		if [[ -n "$foreign" ]]; then
+			printf 'ABORT %s belongs to root, but %s is owned or writable by another user: not run as root\n' \
+				"$FROXLOR" "${foreign#"$FROXLOR"/}" | sanitize_output >"$out"
+			return 2
+		fi
+		(close_extra_fds; cd / && exec timeout 300 php -d memory_limit=512M "$LIB/compat.php" "$FROXLOR") </dev/null 2>&1 \
+			| sanitize_output | head -c 2M >"$out"
+		rc=${PIPESTATUS[0]}
+	fi
+	case "$rc" in
+		0 | 1)
+			if ! grep -qx 'DONE' "$out"; then
+				echo "ABORT the check did not run to the end (exit code $rc) — loaded code may have called exit" >>"$out"
+				return 2
+			fi
+			if ((rc == 1)) && ! grep -q '^FAIL ' "$out"; then
+				echo "ABORT the check ended with exit code 1 without naming a problem" >>"$out"
+				return 2
+			fi
+			return "$rc"
+			;;
+		124) echo "ABORT the check did not finish within 5 minutes" >>"$out" ;;
+		*) grep -q '^ABORT' "$out" || echo "ABORT the check ended with exit code $rc" >>"$out" ;;
+	esac
+	return 2
+}
+
+# The problems (FAIL/ABORT lines) of a compat_check output.
+compat_problems() { grep -E '^(FAIL|ABORT) ' "$1" 2>/dev/null; }
+
+# compat_new BEFORE AFTER: the problem lines of AFTER that BEFORE does not
+# have. Compared without line numbers: the installers that run in between
+# may bring newer extension files, and Froxlor's files change with the
+# update, so the same problem can move to another line.
+compat_new() {
+	LC_ALL=C awk -v want="${3:-new}" '
+		function key(line) {
+			gsub(/:[0-9]+(:|\))/, ":", line)
+			gsub(/line [0-9]+: /, "", line)
+			gsub(/ on line [0-9]+/, "", line)
+			return line
+		}
+		FILENAME == ARGV[1] { if ($0 ~ /^(FAIL|ABORT) /) seen[key($0)] = 1; next }
+		$0 ~ /^(FAIL|ABORT) / {
+			k = key($0)
+			if ((want == "new") != (k in seen) && !(k in printed)) { printed[k] = 1; print }
+		}' "$1" "$2"
+}
+
+# After the update: compares with the check before (COMPAT_BEFORE) and
+# reports only what is new. Sets COMPAT (ok|problems|unavailable) and
+# COMPAT_NEW (the new problems, one per line).
+compat_after() {
+	local after rc before_rc="${COMPAT_BEFORE_RC:-2}" known
+	COMPAT=ok
+	COMPAT_NEW=""
+	after="$(mktemp "$STATE/.compat-after-XXXXXX")" || { COMPAT=unavailable; return; }
+	log "Checking the extensions with Froxlor $1 ..."
+	compat_check "$after"
+	rc=$?
+	grep '^PASS ' "$after" >>"$LOGFILE"
+	if ((rc == 2)); then
+		# Not run to the end (timeout, Froxlor itself not loadable, exit in
+		# loaded code): say so, but do not blame an extension for it.
+		log "The compatibility check could not run to the end:"
+		compat_problems "$after" | sed 's/^/  /' | tee -a "$LOGFILE"
+		COMPAT=unavailable
+		rm -f -- "$after"
+		return
+	fi
+	if ((before_rc == 2)); then
+		log "There is no check from before the update to compare with: every problem counts as new."
+		: >"$COMPAT_BEFORE"
+	fi
+	COMPAT_NEW="$(compat_new "$COMPAT_BEFORE" "$after")"
+	known="$(compat_new "$COMPAT_BEFORE" "$after" known)"
+	if [[ -n "$known" ]]; then
+		log "Problems that already existed before the update ($(printf '%s\n' "$known" | wc -l)):"
+		printf '%s\n' "$known" | sed 's/^/  /' >>"$LOGFILE"
+	fi
+	if [[ -n "$COMPAT_NEW" ]]; then
+		COMPAT=problems
+		log "New problems with Froxlor $1 ($(printf '%s\n' "$COMPAT_NEW" | wc -l)):"
+		printf '%s\n' "$COMPAT_NEW" | sed 's/^/  /' | tee -a "$LOGFILE"
+	else
+		log "No new problems found."
+	fi
+	rm -f -- "$after"
+}
+
 # Twig caches compiled templates. Cleared as the owner of the Froxlor
 # directory (that user owns cache/ and could plant links in it).
 clear_twig_cache() {
@@ -402,7 +520,7 @@ cmd_run() {
 	chgrp "$PANEL_GID" "$LOGFILE" 2>/dev/null || true
 	chmod 0640 "$LOGFILE"
 
-	rm -f -- "$STATE/status.previous.json"
+	rm -f -- "$STATE/status.previous.json" "$STATE"/.compat-*
 	if [[ -f "$STATE/status.json" && ! -L "$STATE/status.json" ]]; then
 		cp -p -- "$STATE/status.json" "$STATE/status.previous.json"
 	fi
@@ -450,6 +568,17 @@ cmd_run() {
 			esac
 		fi
 	fi
+
+	# The extensions on the old version: what fails already is not new later.
+	COMPAT_BEFORE="$(mktemp "$STATE/.compat-before-XXXXXX")" || fail state_failed "cannot create a file in $STATE"
+	log "Checking the extensions with Froxlor $FROM (for comparison afterwards) ..."
+	compat_check "$COMPAT_BEFORE"
+	COMPAT_BEFORE_RC=$?
+	case "$COMPAT_BEFORE_RC" in
+		0) log "No problems." ;;
+		1) log "Problems already now ($(compat_problems "$COMPAT_BEFORE" | wc -l)) — only new ones will be reported after the update." ;;
+		*) log "The check could not run: $(compat_problems "$COMPAT_BEFORE" | tail -n 1)" ;;
+	esac
 
 	check_space || fail no_space "not enough disk space, nothing was changed"
 
@@ -513,17 +642,55 @@ cmd_run() {
 	reinstall_extensions
 	clear_twig_cache
 
+	status phase=compat
+	compat_after "$to"
+	status compat="$COMPAT"
 	if [[ -n "$FAILED_EXTENSIONS" ]]; then
 		status warnings="$FAILED_EXTENSIONS"
+	fi
+	if [[ "$COMPAT" == problems ]]; then
+		# For the page: the first problems without the "FAIL " prefix, the
+		# full list is in the log.
+		local shown count
+		count="$(printf '%s\n' "$COMPAT_NEW" | wc -l)"
+		shown="$(printf '%s\n' "$COMPAT_NEW" | head -n 12 | sed -E 's/^(FAIL|ABORT) //')"
+		((count > 12)) && shown="$shown"$'\n'"… $((count - 12)) more in the log"
+		status problems="$shown"
+		finish "done" extensions_incompatible "Froxlor $to; $count new problem(s) with extensions${FAILED_EXTENSIONS:+; install.sh failed: $FAILED_EXTENSIONS}"
+	fi
+	if [[ -n "$FAILED_EXTENSIONS" ]]; then
 		finish "done" extensions_failed "Froxlor $to; re-run install.sh by hand: $FAILED_EXTENSIONS"
 	fi
 	finish "done" "$result" "$FROM -> $to"
+}
+
+# The compatibility check on demand, for example after installing or
+# updating an extension, or after updating Froxlor by hand.
+cmd_check() {
+	[[ $EUID -eq 0 ]] || die "run as root."
+	load_config
+	exec 9>"$LOCK" || die "cannot open $LOCK"
+	flock -n 9 || die "an update is running — check again when it has finished."
+	local out rc
+	out="$(mktemp)" || die "cannot create a temporary file"
+	compat_check "$out"
+	rc=$?
+	cat -- "$out"
+	rm -f -- "$out"
+	echo
+	case "$rc" in
+		0) echo "No problems found: the extensions load with Froxlor $(php "$LIB/helper.php" state "$FROXLOR" 2>/dev/null | php -r 'echo json_decode(stream_get_contents(STDIN), true)["version"] ?? "";')." ;;
+		1) echo "Problems found (FAIL lines above)." ;;
+		*) echo "The check could not run (ABORT line above)." ;;
+	esac
+	exit "$rc"
 }
 
 # ExecStopPost of the service: a run that was killed (timeout, reboot, OOM)
 # must not stay "running" in the panel forever.
 cmd_service_stopped() {
 	load_config
+	rm -f -- "$STATE"/.compat-*
 	if [[ "$(status_get state)" == running ]]; then
 		status state=failed phase=finished code=interrupted detail="${SERVICE_RESULT:-killed}" finished="$(date +%s)"
 	fi
@@ -624,12 +791,13 @@ cmd_restore() {
 
 case "${1:-}" in
 	run) cmd_run ;;
+	check) cmd_check ;;
 	service-stopped) cmd_service_stopped ;;
 	status) cmd_status ;;
 	snapshots) cmd_snapshots ;;
 	restore) cmd_restore "${2:-}" "${3:-}" ;;
 	*)
-		echo "Usage: $NAME run|status|snapshots|restore <snapshot>" >&2
+		echo "Usage: $NAME run|check|status|snapshots|restore <snapshot>" >&2
 		exit 1
 		;;
 esac

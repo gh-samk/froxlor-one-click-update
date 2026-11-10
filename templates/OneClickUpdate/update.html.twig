@@ -149,6 +149,7 @@
 							{% if runner and runner.reinstall is not empty %}
 								<li>{{ ocu_t('Afterwards the installed extensions are set up again (%d).', runner.reinstall|length) }}</li>
 							{% endif %}
+							<li>{{ ocu_t('Finally the extensions are checked against the new version: menu, settings, classes and templates must still load. Problems are reported here.') }}</li>
 						</ul>
 					</div>
 				</section>
@@ -190,6 +191,19 @@
 							{% endif %}
 							<span>{{ run.message }}</span>
 						</p>
+						{% if run.problems is not empty %}
+							<ul class="small mb-3" id="ocu-problems">
+								{% for problem in run.problems %}<li><code class="text-break">{{ problem }}</code></li>{% endfor %}
+							</ul>
+							{% if run.install_failed is not empty %}
+								<p class="small mb-2">{{ ocu_t('In addition, the installer of these extensions failed: %s', run.install_failed|join(', ')) }}</p>
+							{% endif %}
+							<p class="small mb-3">{{ run.snapshot ? ocu_t('Update the extension or tell its author. If the panel shows errors in the meantime, put the snapshot back with the command below.') : ocu_t('Update the extension or tell its author.') }}</p>
+						{% elseif run.compat == 'ok' %}
+							<p class="small text-body-secondary mb-3">{{ ocu_t('The extensions were checked with the new version: no new problems.') }}</p>
+						{% elseif run.compat == 'unavailable' %}
+							<p class="small text-body-secondary mb-3">{{ ocu_t('The extensions could not be checked with the new version. Details are in the log.') }}</p>
+						{% endif %}
 						<dl class="row small mb-0">
 							{% if run.started %}
 								<dt class="col-sm-4 col-lg-3 fw-normal text-body-secondary">{{ ocu_t('Started') }}</dt>
@@ -248,6 +262,7 @@
 					{% endif %}
 					<p class="mb-1 text-body-secondary">{{ ocu_t('On the server (as root):') }}</p>
 					<ul class="list-unstyled mb-0">
+						<li><code>froxlor-one-click-update check</code></li>
 						<li><code>froxlor-one-click-update status</code></li>
 						<li><code>froxlor-one-click-update snapshots</code></li>
 						<li><code>froxlor-one-click-update restore &lt;snapshot&gt;</code></li>

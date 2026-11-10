@@ -18,8 +18,12 @@
 #     marker (ExecStopPost)
 #   - the request file is only removed, never followed
 #   - a real update to the newest version, then a run with nothing to do
+#   - the compatibility check: a problem that existed before the update is
+#     only logged, one that appears with the update is reported
 #   - restore of the snapshot (back to the starting version)
 
+# Variables are also read by check (eval).
+# shellcheck disable=SC2034
 set -uo pipefail
 
 FROXLOR="${1:-}"
@@ -106,7 +110,6 @@ cp -p /tmp/ocu-config.bak "$CONF"
 echo "Second run while one is running"
 exec 8>"$STATE/run.lock"
 flock -n 8
-# shellcheck disable=SC2034 # read by check (eval)
 out="$("$TOOL" run 2>&1)"
 check "refused: another run" '[[ "$out" == *"Another run is in progress"* ]]'
 exec 8>&-
@@ -124,6 +127,24 @@ php "/usr/local/lib/$NAME/helper.php" status-set "$STATE/status.json" -1 state=r
 SERVICE_RESULT=timeout "$TOOL" service-stopped
 check "state failed, code interrupted" '[[ "$(field state)" == failed && "$(field code)" == interrupted && "$(field detail)" == timeout ]]'
 
+echo "Compatibility check: one problem before, one that comes with the update"
+OWNER_UID="$(stat -c %u "$FROXLOR")"
+OWNER_GID="$(stat -c %g "$FROXLOR")"
+install -d -o "$OWNER_UID" -g "$OWNER_GID" "$FROXLOR/templates/OcuBefore"
+printf '{{ value|ocu_before_filter }}\n' >"$FROXLOR/templates/OcuBefore/old.html.twig"
+chown "$OWNER_UID:$OWNER_GID" "$FROXLOR/templates/OcuBefore/old.html.twig"
+# An "extension" whose installer (run after the update) adds a broken template.
+install -d -o 0 -g 0 -m 0755 /tmp/ocu-plant
+cat >/tmp/ocu-plant/install.sh <<'SH'
+#!/bin/bash
+d="$1"
+install -d -o "$(stat -c %u "$d")" -g "$(stat -c %g "$d")" "$d/templates/OcuAfter"
+printf '{{ value|ocu_after_filter }}\n' >"$d/templates/OcuAfter/new.html.twig"
+chown "$(stat -c %u "$d"):$(stat -c %g "$d")" "$d/templates/OcuAfter/new.html.twig"
+SH
+chmod 0755 /tmp/ocu-plant/install.sh
+sed -i 's|^REINSTALL="\(.*\)"|REINSTALL="\1 /tmp/ocu-plant"|' "$CONF"
+
 echo "The request file is removed, never followed"
 touch /tmp/ocu-victim
 ln -sf /tmp/ocu-victim "$STATE/request/trigger"
@@ -133,7 +154,10 @@ check "link target untouched" '[[ -f /tmp/ocu-victim ]]'
 rm -f /tmp/ocu-victim
 
 echo "Real update"
-check "updated" '[[ "$(field code)" == updated || "$(field code)" == extensions_failed ]]'
+check "updated, new extension problem reported" '[[ "$(field code)" == extensions_incompatible && "$(field compat)" == problems ]]'
+check "only the new problem on the page" '[[ "$(field problems)" == *"OcuAfter/new.html.twig"* && "$(field problems)" != *OcuBefore* ]]'
+check "old problem in the log as already existing" 'grep -q "already existed before the update" "$STATE/logs/$(field log)" && grep -q "OcuBefore/old.html.twig" "$STATE/logs/$(field log)"'
+check "no compat temp files left" '[[ -z "$(find "$STATE" -maxdepth 1 -name ".compat-*")" ]]'
 NEW="$(version)"
 check "files newer than $START ($NEW)" '[[ "$NEW" != "$START" ]]'
 check "database at $NEW" '[[ "$(db_version)" == "$NEW" ]]'
@@ -143,9 +167,12 @@ check "snapshot directory root-only" '[[ "$(stat -c %a /var/backups/$NAME/$SNAP)
 check "log readable by the panel group only" '[[ "$(stat -c %a "$STATE/logs/$(field log)")" == 640 ]]'
 check "no client options file left" '[[ -z "$(find /var/backups/$NAME -name ".client-*")" ]]'
 
+rm -rf "$FROXLOR/templates/OcuBefore" "$FROXLOR/templates/OcuAfter" /tmp/ocu-plant
+cp -p /tmp/ocu-config.bak "$CONF"
+
 echo "Nothing to do"
 run
-check "previous report kept, check time noted" '[[ "$(field code)" == updated || "$(field code)" == extensions_failed ]] && [[ -n "$(field checked)" ]]'
+check "previous report kept, check time noted" '[[ "$(field code)" == extensions_incompatible ]] && [[ -n "$(field checked)" ]]'
 
 echo "Only the database is behind"
 cnf="$(mktemp)"
@@ -154,6 +181,7 @@ db="$(php "/usr/local/lib/$NAME/helper.php" client-options "$FROXLOR" "$cnf")"
 rm -f "$cnf"
 run
 check "result db_updated" '[[ "$(field code)" == db_updated ]]'
+check "extensions checked, no new problems" '[[ "$(field compat)" == ok ]]'
 check "database at $NEW again" '[[ "$(db_version)" == "$NEW" ]]'
 
 echo "Restore"
@@ -162,6 +190,8 @@ check "files back at $START" '[[ "$(version)" == "$START" ]]'
 check "database back at $START" '[[ "$(db_version)" == "$START" ]]'
 check "status says restored" '[[ "$(field code)" == restored ]]'
 check "replaced directory kept" '[[ -n "$(ls -d "$FROXLOR".replaced-* 2>/dev/null)" ]]'
+# The snapshot was taken with the planted template of the compatibility test.
+rm -rf "$FROXLOR/templates/OcuBefore"
 
 echo
 if ((failures == 0)); then

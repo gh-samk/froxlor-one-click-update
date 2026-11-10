@@ -47,7 +47,7 @@ $check = static function (bool $ok, string $text) use (&$failures): void {
 };
 
 $steps = static function (string $active): array {
-	$keys = ['check', 'wait', 'snapshot', 'update', 'verify', 'extensions'];
+	$keys = ['check', 'wait', 'snapshot', 'update', 'verify', 'extensions', 'compat'];
 	$i = array_search($active, $keys, true);
 	$out = [];
 	foreach ($keys as $n => $key) {
@@ -60,6 +60,7 @@ $lastRun = [
 	'state' => 'done', 'phase' => 'finished', 'from' => '2.3.16', 'to' => '2.3.17', 'target' => '2.3.17', 'method' => 'Archive',
 	'started' => '10.11.2026, 12:00', 'finished' => '10.11.2026, 12:01', 'duration' => '1 min 4 s', 'snapshot' => '20261110-120000-2.3.16',
 	'message' => 'Froxlor was updated from 2.3.16 to 2.3.17.', 'detail' => '', 'success' => true, 'warning' => false,
+	'compat' => 'ok', 'problems' => [], 'install_failed' => [],
 ];
 $base = [
 	'current' => '2.3.16',
@@ -99,6 +100,15 @@ $cases = [
 	]),
 	'request stuck' => array_merge($base, ['stuck' => true]),
 	'extensions failed' => array_merge($base, ['run' => array_merge($lastRun, ['warning' => true, 'message' => 'Froxlor was updated, but …'])]),
+	'extensions incompatible' => array_merge($base, ['run' => array_merge($lastRun, [
+		'warning' => true, 'message' => 'Froxlor was updated, but …', 'compat' => 'problems',
+		'problems' => ['navigation admin: Error: Class "Froxlor\\Gone" not found', 'template X/y.html.twig: <script>{{ 7*7 }}</script>'],
+		'install_failed' => ['/opt/pkg/froxlor-backup'],
+	])]),
+	'extensions incompatible, no snapshot' => array_merge($base, ['run' => array_merge($lastRun, [
+		'warning' => true, 'message' => 'Froxlor was updated, but …', 'compat' => 'problems', 'problems' => ['class X: Error'], 'snapshot' => '',
+	])]),
+	'extensions not checked' => array_merge($base, ['run' => array_merge($lastRun, ['compat' => 'unavailable'])]),
 ];
 
 echo "Syntax\n";
@@ -149,6 +159,20 @@ foreach (['en', 'de'] as $language) {
 		}
 		if ($name === 'request stuck') {
 			$check($form && str_contains($html, 'systemctl status froxlor-one-click-update.path'), 'stuck request: hint and the button again');
+		}
+		if ($name === 'up to date, last run') {
+			$check(str_contains($html, 'no new problems') || str_contains($html, 'keine neuen Probleme'), 'compatibility check result shown');
+		}
+		if ($name === 'extensions incompatible') {
+			$check(substr_count($html, '<li><code class="text-break">') === 2 && str_contains($html, '&lt;script&gt;') && !str_contains($html, '<script>{{'), 'problems listed, escaped');
+			$check(str_contains($html, '/opt/pkg/froxlor-backup') && str_contains($html, 'froxlor-one-click-update restore 20261110-120000-2.3.16'), 'failed installer and restore command shown');
+			$check(str_contains($html, 'fa-triangle-exclamation'), 'shown as warning');
+		}
+		if ($name === 'extensions incompatible, no snapshot') {
+			$check(!str_contains($html, 'command below') && !str_contains($html, 'Befehl unten'), 'no restore hint without a snapshot');
+		}
+		if ($name === 'extensions not checked') {
+			$check(str_contains($html, 'could not be checked') || str_contains($html, 'nicht mit der neuen Version geprüft'), 'check not possible shown');
 		}
 		if ($name === 'failed run, stale') {
 			$check(str_contains($html, 'fa-circle-xmark') && $form, 'failed run shown, update still possible');

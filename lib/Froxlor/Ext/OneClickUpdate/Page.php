@@ -28,7 +28,7 @@ final class Page
 	private const FLASH = 'ext_oneclickupdate_flash';
 
 	/** Steps of a run, in order, as reported by the service in status.json "phase". */
-	private const PHASES = ['check', 'wait', 'snapshot', 'update', 'verify', 'extensions'];
+	private const PHASES = ['check', 'wait', 'snapshot', 'update', 'verify', 'extensions', 'compat'];
 
 	public static function run(array $userinfo, string $filename): void
 	{
@@ -167,7 +167,11 @@ final class Page
 			'message' => self::resultMessage($code, $from, $to, $detail),
 			'detail' => $detail,
 			'success' => in_array($state, ['done', 'uptodate', 'restored'], true),
-			'warning' => $code === 'extensions_failed',
+			'warning' => in_array($code, ['extensions_failed', 'extensions_incompatible'], true),
+			// Result of the compatibility check after the update: ok|problems|unavailable.
+			'compat' => (string)($status['compat'] ?? ''),
+			'problems' => self::lines((string)($status['problems'] ?? '')),
+			'install_failed' => $code === 'extensions_incompatible' ? self::lines(str_replace(' ', "\n", (string)($status['warnings'] ?? ''))) : [],
 		];
 	}
 
@@ -180,6 +184,7 @@ final class Page
 			'db_updated' => Lang::t('The pending database update of Froxlor %s was completed.', $to),
 			'restored' => Lang::t('Froxlor was put back to snapshot %s.', $detail),
 			'extensions_failed' => Lang::t('Froxlor was updated from %s to %s, but the installer of at least one extension failed. Run it again by hand: %s', $from, $to, $detail),
+			'extensions_incompatible' => Lang::t('Froxlor was updated from %s to %s, but at least one extension does not load correctly with the new version:', $from, $to),
 			'no_update' => Lang::t('Froxlor was already up to date, nothing was changed.'),
 			'check_failed' => Lang::t('The version check failed — the version server may be unreachable. Nothing was changed.'),
 			'state_failed' => Lang::t('The installed version could not be read. Nothing was changed.'),
@@ -210,6 +215,7 @@ final class Page
 			'update' => Lang::t('Install the new version'),
 			'verify' => Lang::t('Check files and database'),
 			'extensions' => Lang::t('Reinstall extensions'),
+			'compat' => Lang::t('Check extensions with the new version'),
 		];
 		$phase = (string)($status['phase'] ?? '');
 		if ($phase === 'database') {
@@ -234,6 +240,12 @@ final class Page
 		}
 
 		return $steps;
+	}
+
+	/** @return list<string> the non-empty lines of a text */
+	private static function lines(string $text): array
+	{
+		return array_values(array_filter(array_map('trim', explode("\n", $text)), static fn(string $l): bool => $l !== ''));
 	}
 
 	private static function runnerView(?array $runner): ?array
